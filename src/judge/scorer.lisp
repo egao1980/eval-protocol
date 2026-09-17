@@ -31,14 +31,19 @@
 
 (defun %judge-prompt (scorer case actual)
   (or (llm-judge-scorer-prompt scorer)
-      (format nil "~
-You are an evaluation judge. Score ACTUAL against EXPECTED.
-Return JSON with keys score (number 0..1), verdict (\"pass\" or \"fail\"), ~
-rationale (short string).
-
-Input: ~s
-Expected: ~s
-Actual: ~s"
+      (format nil
+              (concatenate
+               'string
+               "You are an evaluation judge. Score ACTUAL against EXPECTED."
+               "~%"
+               "Return JSON with keys score (number 0..1), verdict (\"pass\" or \"fail\"), "
+               "rationale (short string)."
+               "~%~%"
+               "Input: ~s"
+               "~%"
+               "Expected: ~s"
+               "~%"
+               "Actual: ~s")
               (eval-case-input case)
               (eval-case-expected case)
               actual)))
