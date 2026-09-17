@@ -9,23 +9,86 @@
 (defclass eval-case ()
   ((input :initarg :input :reader eval-case-input :initform nil)
    (expected :initarg :expected :reader eval-case-expected :initform nil)
-   (metadata :initarg :metadata :reader eval-case-metadata :initform nil)))
+   (metadata :initarg :metadata :reader eval-case-metadata :initform nil)
+   (role :initarg :role :reader eval-case-role :initform nil)
+   (source :initarg :source :reader eval-case-source :initform nil)
+   (parent-version :initarg :parent-version :reader eval-case-parent-version
+                   :initform nil)))
 
 (defun eval-case-p (x)
   (typep x 'eval-case))
 
-(defun make-eval-case (&key input expected (metadata nil))
+(defun dataset-role-p (role)
+  (and (keywordp role)
+       (member role '(:train :dev :holdout) :test #'eq)))
+
+(defun %canonicalize-role (role)
+  (when role
+    (check-type role keyword)
+    (unless (dataset-role-p role)
+      (error 'eval-error
+             :message (format nil "unknown dataset role ~s; expected :TRAIN, :DEV, or :HOLDOUT"
+                              role)))
+    role))
+
+(defun %holdout-blocked-source-p (source)
+  (member source '(:human-feedback :production) :test #'eq))
+
+(defun make-eval-case (&key input expected (metadata nil)
+                            (role nil) (source nil) (parent-version nil))
   (check-type metadata list)
+  (when source (check-type source keyword))
+  (when parent-version (check-type parent-version string))
   (make-instance 'eval-case
                  :input input
                  :expected expected
-                 :metadata (copy-list metadata)))
+                 :metadata (copy-list metadata)
+                 :role (%canonicalize-role role)
+                 :source source
+                 :parent-version parent-version))
+
+(defun eval-case-lineage (case)
+  "Plist of :SOURCE, :ROLE, and :PARENT-VERSION recorded on CASE."
+  (check-type case eval-case)
+  (list :source (eval-case-source case)
+        :role (eval-case-role case)
+        :parent-version (eval-case-parent-version case)))
+
+(defun %copy-eval-case (case &key role source parent-version)
+  (make-eval-case
+   :input (eval-case-input case)
+   :expected (eval-case-expected case)
+   :metadata (copy-list (eval-case-metadata case))
+   :role (or role (eval-case-role case))
+   :source (or source (eval-case-source case))
+   :parent-version (or parent-version (eval-case-parent-version case))))
+
+(defun %effective-case-role (case &optional dataset-role supplied-role)
+  (or supplied-role
+      (and case (eval-case-role case))
+      dataset-role
+      :train))
+
+(defun %check-holdout-admission (case source role &optional dataset)
+  (when (and (eq role :holdout) (%holdout-blocked-source-p source))
+    (restart-case
+        (error 'holdout-admission-error
+               :message (format nil "source ~s cannot enter holdout" source)
+               :source source
+               :role role
+               :case case
+               :dataset dataset)
+      (force-holdout-admission ()
+        :report "Explicitly admit this production/feedback case into the holdout split"
+        nil)))
+  (values))
 
 (defclass eval-dataset ()
   ((name :initarg :name :reader eval-dataset-name)
    (cases :initarg :cases :reader eval-dataset-cases :initform nil)
    (version :initarg :version :reader eval-dataset-version)
-   (provenance :initarg :provenance :reader eval-dataset-provenance :initform nil)))
+   (provenance :initarg :provenance :reader eval-dataset-provenance :initform nil)
+   (role :initarg :role :reader eval-dataset-role :initform nil)))
 
 (defun eval-dataset-p (x)
   (typep x 'eval-dataset))
@@ -65,7 +128,10 @@
 (defun %canonical-case (case)
   (list :input (%canonical-atom (eval-case-input case))
         :expected (%canonical-atom (eval-case-expected case))
-        :metadata (%canonical-plist (eval-case-metadata case))))
+        :metadata (%canonical-plist (eval-case-metadata case))
+        :role (eval-case-role case)
+        :source (eval-case-source case)
+        :parent-version (eval-case-parent-version case)))
 
 (defun %canonical-string (sexp)
   (with-standard-io-syntax
@@ -118,29 +184,52 @@
          (digest (%fnv1a-64 (%utf8-bytes printed))))
     (string-downcase (format nil "~16,'0x" digest))))
 
-(defun make-eval-dataset (&key name (cases nil) (provenance nil))
+(defun make-eval-dataset (&key name (cases nil) (provenance nil) (role nil))
   (check-type name string)
   (check-type cases list)
   (check-type provenance list)
-  (dolist (c cases)
-    (check-type c eval-case))
-  (let ((copied (copy-list cases)))
-    (make-instance 'eval-dataset
-                   :name name
-                   :cases copied
-                   :version (%dataset-content-hash copied)
-                   :provenance (copy-list provenance))))
+  (let ((dataset-role (%canonicalize-role role)))
+    (dolist (c cases)
+      (check-type c eval-case)
+      (unless (eval-case-parent-version c)
+        (%check-holdout-admission
+         c (eval-case-source c)
+         (%effective-case-role c dataset-role))))
+    (let ((copied (mapcar (lambda (c)
+                            (if (eval-case-role c)
+                                c
+                                (%copy-eval-case
+                                 c :role (%effective-case-role c dataset-role))))
+                          cases)))
+      (make-instance 'eval-dataset
+                     :name name
+                     :cases copied
+                     :version (%dataset-content-hash copied)
+                     :provenance (copy-list provenance)
+                     :role dataset-role))))
 
-(defun add-case (dataset case &key source)
+(defun add-case (dataset case &key source role)
   "Return a NEW dataset version with CASE appended. DATASET is not mutated.
-   SOURCE is recorded on the new version's provenance (e.g. :HUMAN-FEEDBACK)."
+   SOURCE is recorded on the new version's provenance (e.g. :HUMAN-FEEDBACK)
+   and on the case lineage together with ROLE and the parent dataset version.
+   Production / :HUMAN-FEEDBACK cases cannot enter a :HOLDOUT split unless
+   the FORCE-HOLDOUT-ADMISSION restart is invoked explicitly."
   (check-type dataset eval-dataset)
   (check-type case eval-case)
-  (make-eval-dataset
-   :name (eval-dataset-name dataset)
-   :cases (append (eval-dataset-cases dataset) (list case))
-   :provenance (append (eval-dataset-provenance dataset)
-                       (when source (list source)))))
+  (when source (check-type source keyword))
+  (let* ((effective-role (%effective-case-role case (eval-dataset-role dataset) role))
+         (effective-source (or source (eval-case-source case))))
+    (%check-holdout-admission case effective-source effective-role dataset)
+    (let ((stamped (%copy-eval-case case
+                                    :role effective-role
+                                    :source effective-source
+                                    :parent-version (eval-dataset-version dataset))))
+      (make-eval-dataset
+       :name (eval-dataset-name dataset)
+       :role (eval-dataset-role dataset)
+       :cases (append (eval-dataset-cases dataset) (list stamped))
+       :provenance (append (eval-dataset-provenance dataset)
+                           (when source (list source)))))))
 
 (defclass eval-score ()
   ((value :initarg :value :reader eval-score-value :initform 0)
@@ -408,7 +497,10 @@
     ((eval-case-p value)
      (%jsonify (list :input (eval-case-input value)
                      :expected (eval-case-expected value)
-                     :metadata (eval-case-metadata value))))
+                     :metadata (eval-case-metadata value)
+                     :role (eval-case-role value)
+                     :source (eval-case-source value)
+                     :parent-version (eval-case-parent-version value))))
     ((and (consp value) (keywordp (car value)) (%proper-list-p value)
           (evenp (length (cdr value))))
      (let ((ht (make-hash-table :test 'equal)))
@@ -482,17 +574,25 @@
       ((:json) (%json-report-string sexp)))))
 
 (defun %case-plist (case)
-  (let ((md (eval-case-metadata case)))
+  (let ((md (eval-case-metadata case))
+        (role (eval-case-role case))
+        (source (eval-case-source case))
+        (parent (eval-case-parent-version case)))
     (append (list :input (eval-case-input case)
                   :expected (eval-case-expected case))
-            (when md (list :metadata md)))))
+            (when md (list :metadata md))
+            (when role (list :role role))
+            (when source (list :source source))
+            (when parent (list :parent-version parent)))))
 
 (defun %dataset-sexp (dataset)
-  (list :eval-dataset
-        :name (eval-dataset-name dataset)
-        :version (eval-dataset-version dataset)
-        :provenance (eval-dataset-provenance dataset)
-        :cases (mapcar #'%case-plist (eval-dataset-cases dataset))))
+  (append (list :eval-dataset
+                :name (eval-dataset-name dataset)
+                :version (eval-dataset-version dataset)
+                :provenance (eval-dataset-provenance dataset)
+                :cases (mapcar #'%case-plist (eval-dataset-cases dataset)))
+          (when (eval-dataset-role dataset)
+            (list :role (eval-dataset-role dataset)))))
 
 (defun %write-sexp (sexp)
   (with-standard-io-syntax
@@ -508,12 +608,16 @@
 (defun %case-from-plist (plist)
   (make-eval-case :input (%plist-get plist :input)
                   :expected (%plist-get plist :expected)
-                  :metadata (copy-list (%plist-get plist :metadata))))
+                  :metadata (copy-list (%plist-get plist :metadata))
+                  :role (%plist-get plist :role)
+                  :source (%plist-get plist :source)
+                  :parent-version (%plist-get plist :parent-version)))
 
 (defun %dataset-from-plist (plist)
   (let ((body (if (eq (first plist) :eval-dataset) (rest plist) plist)))
     (make-eval-dataset
      :name (or (%plist-get body :name) "unnamed")
+     :role (%plist-get body :role)
      :cases (mapcar #'%case-from-plist (%plist-get body :cases))
      :provenance (copy-list (%plist-get body :provenance)))))
 
@@ -528,6 +632,14 @@
     ((listp obj) (or (getf obj key)
                      (getf obj (intern (string-upcase (string key)) :keyword))))))
 
+(defun %keywordize (value)
+  (cond
+    ((null value) nil)
+    ((keywordp value) value)
+    ((symbolp value) (intern (symbol-name value) :keyword))
+    ((stringp value) (intern (string-upcase value) :keyword))
+    (t value)))
+
 (defun %case-from-json (obj)
   (make-eval-case
    :input (%alistish-get obj :input)
@@ -540,7 +652,11 @@
                                                  v acc)))
                               md)
                      (nreverse acc))
-                   (copy-list md)))))
+                   (copy-list md)))
+   :role (%keywordize (%alistish-get obj :role))
+   :source (%keywordize (%alistish-get obj :source))
+   :parent-version (let ((p (%alistish-get obj :parent-version)))
+                     (and p (princ-to-string p)))))
 
 (defun %dataset-from-json (obj)
   (let ((inner (if (and (listp obj) (eq (first obj) :eval-dataset))
@@ -550,6 +666,8 @@
      :name (or (%alistish-get inner :name)
                (%alistish-get inner "name")
                "unnamed")
+     :role (%keywordize (or (%alistish-get inner :role)
+                            (%alistish-get inner "role")))
      :cases (let ((cases (%alistish-get inner :cases)))
               (map 'list #'%case-from-json
                    (if (and cases (not (listp cases)))
@@ -723,3 +841,220 @@
   (every (lambda (p)
            (gate-passes-p p baseline-run candidate-run))
          (composed-gate-policies policy)))
+
+;;; --- roles / splits / lineage ----------------------------------------------
+
+(defun dataset-split (dataset &key role)
+  "Return a new dataset containing only cases whose role is ROLE.
+   ROLE must be :TRAIN, :DEV, or :HOLDOUT."
+  (check-type dataset eval-dataset)
+  (let ((want (%canonicalize-role role)))
+    (unless want
+      (error 'eval-error :message "dataset-split requires :role"))
+    (make-eval-dataset
+     :name (eval-dataset-name dataset)
+     :role want
+     :cases (remove-if-not (lambda (c) (eq (eval-case-role c) want))
+                           (eval-dataset-cases dataset))
+     :provenance (copy-list (eval-dataset-provenance dataset)))))
+
+(defun assert-no-holdout-overlap (train holdout)
+  "Signal HOLDOUT-OVERLAP-ERROR when TRAIN and HOLDOUT share any case
+   identity (input + expected). Search/train data and the promotion
+   holdout must never overlap."
+  (check-type train eval-dataset)
+  (check-type holdout eval-dataset)
+  (let* ((train-keys (mapcar #'%case-key (eval-dataset-cases train)))
+         (overlap (loop for case in (eval-dataset-cases holdout)
+                        for key = (%case-key case)
+                        when (member key train-keys :test #'equal)
+                          collect key)))
+    (when overlap
+      (error 'holdout-overlap-error
+             :message "search/train data and promotion holdout overlap"
+             :train train
+             :holdout holdout
+             :keys (delete-duplicates overlap :test #'equal)))
+    t))
+
+;;; --- paired repeated trials -------------------------------------------------
+
+(defun %n-choose-k (n k)
+  (cond
+    ((or (minusp k) (> k n)) 0)
+    ((or (zerop k) (= k n)) 1)
+    (t
+     (let ((k (min k (- n k)))
+           (acc 1))
+       (loop for i from 1 to k
+             do (setf acc (* acc (/ (+ (- n k) i) i))))
+       acc))))
+
+(defun %binomial-upper-tail/half (k n)
+  "P(X >= K) for X ~ Binomial(N, 1/2), as an exact rational."
+  (cond
+    ((zerop n) 1)
+    ((< k 0) 1)
+    ((> k n) 0)
+    (t
+     (let ((denom (ash 1 n)))
+       (loop for i from k to n
+             sum (/ (%n-choose-k n i) denom))))))
+
+(defun %sign-test-confidence (wins losses)
+  "One-sided sign-test confidence that the candidate beats the baseline.
+   Ties are dropped. 0 when there are no decisive pairs."
+  (let ((m (+ wins losses)))
+    (if (zerop m)
+        0
+        (- 1 (%binomial-upper-tail/half wins m)))))
+
+(defclass paired-trial-result ()
+  ((n :initarg :n :reader paired-trial-result-n :initform 0)
+   (baseline-runs :initarg :baseline-runs :reader paired-trial-result-baseline-runs
+                  :initform nil)
+   (candidate-runs :initarg :candidate-runs :reader paired-trial-result-candidate-runs
+                   :initform nil)
+   (wins :initarg :wins :reader paired-trial-result-wins :initform 0)
+   (ties :initarg :ties :reader paired-trial-result-ties :initform 0)
+   (losses :initarg :losses :reader paired-trial-result-losses :initform 0)
+   (delta :initarg :delta :reader paired-trial-result-delta :initform 0)
+   (confidence :initarg :confidence :reader paired-trial-result-confidence
+               :initform 0)))
+
+(defun paired-trial-result-p (x)
+  (typep x 'paired-trial-result))
+
+(defun make-paired-trial-result (&key (n 0) (baseline-runs nil) (candidate-runs nil)
+                                      (wins 0) (ties 0) (losses 0) (delta nil)
+                                      (confidence nil))
+  (check-type n (integer 0 *))
+  (check-type wins (integer 0 *))
+  (check-type ties (integer 0 *))
+  (check-type losses (integer 0 *))
+  (make-instance 'paired-trial-result
+                 :n n
+                 :baseline-runs (copy-list baseline-runs)
+                 :candidate-runs (copy-list candidate-runs)
+                 :wins wins
+                 :ties ties
+                 :losses losses
+                 :delta (or delta 0)
+                 :confidence (or confidence (%sign-test-confidence wins losses))))
+
+(defun run-paired-trials (dataset baseline-fn candidate-fn &key (n 1) scorers)
+  "Run N paired evaluations of BASELINE-FN and CANDIDATE-FN on DATASET.
+   Each repetition is one (baseline-run, candidate-run) pair. Confidence is
+   a one-sided sign test on paired run means (ties dropped)."
+  (check-type dataset eval-dataset)
+  (check-type baseline-fn (or function symbol))
+  (check-type candidate-fn (or function symbol))
+  (check-type n (integer 1 *))
+  (let ((baseline-runs nil)
+        (candidate-runs nil))
+    (dotimes (i n)
+      (push (run-eval dataset baseline-fn :scorers scorers) baseline-runs)
+      (push (run-eval dataset candidate-fn :scorers scorers) candidate-runs))
+    (setf baseline-runs (nreverse baseline-runs)
+          candidate-runs (nreverse candidate-runs))
+    (let ((wins 0)
+          (ties 0)
+          (losses 0)
+          (delta-sum 0))
+      (mapc (lambda (b c)
+              (let ((d (- (eval-run-mean c) (eval-run-mean b))))
+                (incf delta-sum d)
+                (cond
+                  ((> d 0) (incf wins))
+                  ((< d 0) (incf losses))
+                  (t (incf ties)))))
+            baseline-runs
+            candidate-runs)
+      (make-paired-trial-result
+       :n n
+       :baseline-runs baseline-runs
+       :candidate-runs candidate-runs
+       :wins wins
+       :ties ties
+       :losses losses
+       :delta (/ delta-sum n)
+       :confidence (%sign-test-confidence wins losses)))))
+
+(defun paired-trial-gate-passes-p (result &key (min-sample 1)
+                                              (confidence-threshold 95/100))
+  "T when RESULT may be promoted: N >= MIN-SAMPLE and confidence at least
+   CONFIDENCE-THRESHOLD. Default deny when either check fails."
+  (check-type result paired-trial-result)
+  (check-type min-sample (integer 1 *))
+  (check-type confidence-threshold (real 0 1))
+  (and (>= (paired-trial-result-n result) min-sample)
+       (>= (paired-trial-result-confidence result) confidence-threshold)))
+
+(defun assert-paired-trial-promote (result &key (min-sample 1)
+                                               (confidence-threshold 95/100))
+  "Signal PAIRED-TRIAL-GATE-ERROR unless RESULT clears the promote gate."
+  (unless (paired-trial-gate-passes-p
+           result
+           :min-sample min-sample
+           :confidence-threshold confidence-threshold)
+    (error 'paired-trial-gate-error
+           :message "n below min-sample or confidence below threshold"
+           :n (paired-trial-result-n result)
+           :min-sample min-sample
+           :confidence (paired-trial-result-confidence result)
+           :confidence-threshold confidence-threshold
+           :result result))
+  result)
+
+;;; --- promotion stages -------------------------------------------------------
+
+(defun promotion-stages ()
+  '(:shadow :canary :promote))
+
+(defun promotion-stage-p (stage)
+  (and (keywordp stage)
+       (member stage (promotion-stages) :test #'eq)))
+
+(defun next-promotion-stage (stage)
+  (ecase stage
+    (:shadow :canary)
+    (:canary :promote)
+    (:promote nil)))
+
+(defclass promotion-record ()
+  ((stage :initarg :stage :reader promotion-record-stage)
+   (rollback-p :initarg :rollback-p :reader promotion-record-rollback-p
+               :initform nil)
+   (reason :initarg :reason :reader promotion-record-reason :initform nil)
+   (from-stage :initarg :from-stage :reader promotion-record-from-stage
+               :initform nil)))
+
+(defun promotion-record-p (x)
+  (typep x 'promotion-record))
+
+(defun make-promotion-record (stage &key rollback-p reason from-stage)
+  (unless (or rollback-p (promotion-stage-p stage))
+    (error 'eval-error
+           :message (format nil "unknown promotion stage ~s; expected ~s"
+                            stage (promotion-stages))))
+  (when (and rollback-p stage (not (promotion-stage-p stage)))
+    (error 'eval-error
+           :message (format nil "unknown promotion stage ~s; expected ~s"
+                            stage (promotion-stages))))
+  (make-instance 'promotion-record
+                 :stage stage
+                 :rollback-p (and rollback-p t)
+                 :reason reason
+                 :from-stage from-stage))
+
+(defun make-rollback-marker (&key (from :promote) reason)
+  "Rollback marker for a promotion record. FROM names the stage being
+   rolled back (default :PROMOTE)."
+  (unless (promotion-stage-p from)
+    (error 'eval-error
+           :message (format nil "unknown promotion stage ~s; expected ~s"
+                            from (promotion-stages))))
+  (make-promotion-record from :rollback-p t :reason reason :from-stage from))
+
+(defun rollback-marker-p (x)
+  (and (promotion-record-p x) (promotion-record-rollback-p x)))
