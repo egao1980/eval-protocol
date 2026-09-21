@@ -42,6 +42,10 @@ Gates (both implement `gate-passes-p`):
 
 Jev/Kev `confidence` is `choice-concentration` — `(pmax - 1/k) / (1 - 1/k)` — a **display** helper, never `P(correct)`. Gates read mass / Brier / ECE only (`concentration-as-accuracy-forbidden`).
 
+```bash
+sbcl --load examples/calibration.lisp
+```
+
 ## License
 
 MIT
