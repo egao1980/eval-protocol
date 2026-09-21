@@ -1,5 +1,5 @@
 (defsystem "eval-protocol"
-  :version "0.2.0"
+  :version "0.3.0"
   :description "CLOS evaluation protocol for cl-stack (datasets, scorers, gates)"
   :author "egao1980"
   :license "MIT"
@@ -10,11 +10,12 @@
   :pathname "src"
   :components ((:file "package")
                (:file "conditions")
-               (:file "protocol"))
+               (:file "protocol")
+               (:file "calibration"))
   :in-order-to ((test-op (test-op "eval-protocol/tests"))))
 
 (defsystem "eval-protocol/judge"
-  :version "0.2.0"
+  :version "0.3.0"
   :description "LLM-judge scorer for eval-protocol"
   :author "egao1980"
   :license "MIT"
@@ -33,6 +34,7 @@
                (:file "gates-test")
                (:file "restarts-test")
                (:file "roles-test")
+               (:file "calibration-test")
                (:file "judge-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)

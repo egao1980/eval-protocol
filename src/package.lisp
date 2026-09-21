@@ -137,6 +137,34 @@
            #:llm-judge-scorer
            #:make-llm-judge-scorer
            #:llm-judge-scorer-backend
-           #:llm-judge-scorer-prompt))
+           #:llm-judge-scorer-prompt
+
+           #:brier-score
+           #:log-loss
+           #:reliability-bins
+           #:expected-calibration-error
+           #:automation-at-budget
+           #:option-order-spread
+           #:isolation-delta
+           #:drift-report
+           #:drift-report-p
+           #:make-drift-report
+           #:drift-report-baseline
+           #:drift-report-candidate
+           #:drift-report-metrics
+           #:drift-report-deltas
+           #:drift-report-brier-delta
+           #:drift-report-ece-delta
+           #:calibration-gate
+           #:make-calibration-gate
+           #:calibration-gate-brier-delta
+           #:calibration-gate-ece-delta
+           #:option-order-gate
+           #:make-option-order-gate
+           #:option-order-gate-max-spread
+           #:choice-concentration
+           #:concentration-as-accuracy-forbidden
+           #:calibration-treats-concentration-as-accuracy-p
+           #:confidence-is-not-accuracy-p))
 
 (in-package #:eval-protocol)

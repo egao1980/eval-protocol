@@ -27,6 +27,21 @@ Datasets and cases carry a role (`:train` `:dev` `:holdout`) plus lineage (`sour
 
 Promotion stages are data: `:shadow` → `:canary` → `:promote`, plus `make-rollback-marker`.
 
+## Calibration (0.3.0)
+
+Calibration is empirical for `(backend, model-version, cohort, window)`. It is not a type.
+
+Proper scores `brier-score` / `log-loss` consume a probability **mass** alist and a true outcome (binary `T`/`NIL` also match `:true`/`:false`). `reliability-bins` and `expected-calibration-error` take `(predicted-p-of-chosen . correct-p)` pairs — equal-width bins on `[0,1]`, with `1.0` in the last bin. `automation-at-budget` is the fraction of cases that can be auto-acted when we only act at `p_chosen >= t` and the error among acted cases stays `<= max-error` (lowest covering `t` that meets the budget; if several observed `t` induce that set, the highest is the cutoff).
+
+`option-order-spread` and `isolation-delta` measure permute / packed-vs-separate stability. `make-drift-report` / `drift-report` compare Brier and ECE deltas vs a pinned baseline cohort.
+
+Gates (both implement `gate-passes-p`):
+
+- `calibration-gate` — candidate Brier and ECE must not worsen vs baseline by more than `:brier-delta` / `:ece-delta` (default 0)
+- `option-order-gate` — max spread across options `<= :max-spread`
+
+Jev/Kev `confidence` is `choice-concentration` — `(pmax - 1/k) / (1 - 1/k)` — a **display** helper, never `P(correct)`. Gates read mass / Brier / ECE only (`concentration-as-accuracy-forbidden`).
+
 ## License
 
 MIT
